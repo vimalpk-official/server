@@ -248,42 +248,52 @@ app.post("/save/data", upload.single("profilePic"), async (req, res) => {
       await client.close();
       console.log("🔒 MongoDB connection closed");
     }
-  }
+  }x
 });
 
-// DELETE route to remove a member
+// FIXED DELETE route to remove a member
 app.delete("/delete/member", async (req, res) => {
   console.log("🗑️ Delete member endpoint triggered");
   let client;
 
   try {
     const memberIdToDelete = req.body.key;
+
+    // Validate input
     if (!memberIdToDelete) {
       return res.status(400).json({
         success: false,
-        message: "Member ID is required.",
+        message: "Member ID (key) is required.",
       });
     }
 
-    // Validate ObjectId format
-    if (!ObjectId.isValid(memberIdToDelete)) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid member ID format.",
-      });
-    }
-
-    const objectMemberId = new ObjectId(memberIdToDelete);
+    console.log("🔍 Attempting to delete member with ID:", memberIdToDelete);
 
     client = await connectToMongoDB();
     const db = client.db(dbName);
     const collection = db.collection(collectionName);
 
+    // First, check if the member exists
+    const memberExists = await collection.findOne({
+      "teams.members.memberID._id": memberIdToDelete,
+    });
+
+    if (!memberExists) {
+      console.log("❌ Member not found in database");
+      return res.status(404).json({
+        success: false,
+        message: "Member not found in any team.",
+      });
+    }
+
+    console.log("✅ Member found, proceeding with deletion");
+
+    // Delete the member from all teams using correct query path
     const result = await collection.updateMany(
-      { "teams.members.memberID._id": objectMemberId },
+      { "teams.members.memberID._id": memberIdToDelete },
       {
         $pull: {
-          "teams.$[].members": { "memberID._id": objectMemberId },
+          "teams.$[].members": { "memberID._id": memberIdToDelete },
         },
         $set: {
           updatedAt: new Date(),
@@ -291,18 +301,24 @@ app.delete("/delete/member", async (req, res) => {
       }
     );
 
+    console.log("🔄 Delete operation result:", {
+      matchedCount: result.matchedCount,
+      modifiedCount: result.modifiedCount,
+    });
+
     if (result.modifiedCount === 0) {
       return res.status(404).json({
         success: false,
-        message: "Member not found or already removed.",
+        message: "Member not found or could not be removed.",
       });
     }
 
-    console.log("✅ Member removed from all teams in the document.");
+    console.log("✅ Member successfully removed from all teams");
     res.status(200).json({
       success: true,
       message: "Member successfully removed from all teams.",
       modifiedCount: result.modifiedCount,
+      matchedCount: result.matchedCount,
     });
   } catch (err) {
     console.error("❌ Error deleting member:", err);
