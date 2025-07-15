@@ -50,6 +50,41 @@ async function connectToMongoDB() {
   }
 }
 
+app.post("/login/validation", async (req, res) => {
+  console.log("🔔 Validation endpoint hit");
+
+  const { email } = req.body;
+  console.log("Received email from frontend:", email);
+
+  try {
+    const client = await connectToMongoDB(); // Assuming this returns a connected MongoClient
+    const db = client.db(dbName);
+    const collection = db.collection(collectionName);
+
+    // Search for the email across all team members
+    const memberExists = await collection.findOne({
+      "teams.members.memberID.email": email,
+    });
+
+    if (memberExists) {
+      console.log("✅ Email found in the database.");
+      return res
+        .status(200)
+        .json({ status: "success", message: "Email exists." });
+    } else {
+      console.log("❌ Email does not exist in any team.");
+      return res
+        .status(404)
+        .json({ status: "fail", message: "Email does not exist." });
+    }
+  } catch (error) {
+    console.error("🔥 Error during validation:", error);
+    return res
+      .status(500)
+      .json({ status: "error", message: "Internal server error." });
+  }
+});
+
 // GET route to fetch all data
 app.get("/api/calldata", async (req, res) => {
   console.log("📥 Client triggered the API call data");
@@ -248,7 +283,8 @@ app.post("/save/data", upload.single("profilePic"), async (req, res) => {
       await client.close();
       console.log("🔒 MongoDB connection closed");
     }
-  }x
+  }
+  x;
 });
 
 // FIXED DELETE route to remove a member
@@ -340,6 +376,17 @@ app.post("/update/member", upload.single("profilePic"), async (req, res) => {
   const formData = req.body;
   const memberIdToUpdate = formData.importance;
 
+  // Parse teamIds from formData (assuming it comes as a string or array)
+  let teamIds = [];
+  if (formData.teamIds) {
+    teamIds = Array.isArray(formData.teamIds)
+      ? formData.teamIds
+      : JSON.parse(formData.teamIds);
+  }
+
+  console.log("Form Data:", formData);
+  console.log("Team IDs:", teamIds);
+
   let client;
 
   try {
@@ -358,12 +405,18 @@ app.post("/update/member", upload.single("profilePic"), async (req, res) => {
       });
     }
 
+    if (!teamIds || teamIds.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "At least one team ID is required",
+      });
+    }
+
     client = await connectToMongoDB();
     const db = client.db(dbName);
     const collection = db.collection(collectionName);
 
     // Find the document that contains the member to update
-    // Based on your data structure, it should be "teams.members.memberID._id"
     const documentWithMember = await collection.findOne({
       "teams.members.memberID._id": memberIdToUpdate,
     });
@@ -375,16 +428,13 @@ app.post("/update/member", upload.single("profilePic"), async (req, res) => {
       });
     }
 
-    // Find which team contains the member
-    let foundTeam = null;
+    // Find the existing member data
     let foundMember = null;
-
     for (const team of documentWithMember.teams) {
       const member = team.members.find(
         (m) => m.memberID._id === memberIdToUpdate
       );
       if (member) {
-        foundTeam = team;
         foundMember = member;
         break;
       }
@@ -410,7 +460,13 @@ app.post("/update/member", upload.single("profilePic"), async (req, res) => {
       };
     }
 
-    // Build the updated member object, preserving important original data
+    // Build team array for the member
+    const teamArray = teamIds.map((teamId) => ({
+      name: getTeamNameById(documentWithMember.teams, teamId),
+      _id: teamId,
+    }));
+
+    // Build the updated member object
     const updatedMember = {
       _id: memberIdToUpdate,
       name: formData.name,
@@ -421,12 +477,15 @@ app.post("/update/member", upload.single("profilePic"), async (req, res) => {
       bio: formData.about || foundMember.memberID.bio || "",
       designation:
         formData.designation || foundMember.memberID.designation || "",
-      team: foundMember.memberID.team || [],
+      team: teamArray,
       doj: formData.doj || foundMember.memberID.doj || "",
       dob: formData.dob || foundMember.memberID.dob || "",
       yoe: formData.yoe || foundMember.memberID.yoe || "",
       designationText:
-        formData.designation || foundMember.memberID.designationText || "",
+        formData.designationText ||
+        formData.designation ||
+        foundMember.memberID.designationText ||
+        "",
       createdAt: foundMember.memberID.createdAt || new Date(),
       updatedAt: new Date(),
       __v: foundMember.memberID.__v || 0,
@@ -434,35 +493,78 @@ app.post("/update/member", upload.single("profilePic"), async (req, res) => {
 
     console.log("Updated member data:", updatedMember);
 
-    // Update the member in ALL teams where they exist
-    const updateResult = await collection.updateMany(
+    // Step 1: Remove member from all teams first
+    await collection.updateMany(
       { "teams.members.memberID._id": memberIdToUpdate },
       {
-        $set: {
-          "teams.$[team].members.$[member].memberID": updatedMember,
-          updatedAt: new Date(),
+        $pull: {
+          "teams.$[].members": { "memberID._id": memberIdToUpdate },
         },
-      },
-      {
-        arrayFilters: [
-          { "team.members.memberID._id": memberIdToUpdate },
-          { "member.memberID._id": memberIdToUpdate },
-        ],
+        $set: { updatedAt: new Date() },
       }
     );
 
-    if (updateResult.modifiedCount === 0) {
+    // Step 2: Add/Update member in specified teams
+    const teamUpdateResults = [];
+    let updatedTeamCount = 0;
+
+    // Use the existing member's _id for consistency across all teams
+    const memberEntryId = foundMember._id;
+
+    for (const teamId of teamIds) {
+      // Check if team exists in the document
+      const teamExists = documentWithMember.teams.some(
+        (team) => team._id === teamId
+      );
+
+      if (!teamExists) {
+        console.log(`Team ${teamId} not found in document`);
+        teamUpdateResults.push({
+          teamId: teamId,
+          success: false,
+          message: "Team not found",
+        });
+        continue;
+      }
+
+      // Create member data structure with same _id
+      const memberData = {
+        memberID: updatedMember,
+        _id: memberEntryId, // Use the same _id for all team entries
+      };
+
+      // Add member to the specific team
+      const result = await collection.updateOne(
+        { "teams._id": teamId },
+        {
+          $push: { "teams.$.members": memberData },
+          $set: { updatedAt: new Date() },
+        }
+      );
+
+      teamUpdateResults.push({
+        teamId: teamId,
+        success: result.modifiedCount > 0,
+        modifiedCount: result.modifiedCount,
+      });
+
+      if (result.modifiedCount > 0) updatedTeamCount++;
+    }
+
+    if (updatedTeamCount === 0) {
       return res.status(400).json({
         success: false,
-        message: "Failed to update member",
+        message: "Failed to update member in any team",
+        teamResults: teamUpdateResults,
       });
     }
 
     console.log("✅ Member updated successfully");
     res.status(200).json({
       success: true,
-      message: `Member updated successfully in ${updateResult.modifiedCount} document(s)`,
+      message: `Member updated successfully in ${updatedTeamCount} team(s)`,
       data: updatedMember,
+      teamResults: teamUpdateResults,
     });
   } catch (error) {
     console.error("❌ Error updating member:", error);
@@ -478,6 +580,12 @@ app.post("/update/member", upload.single("profilePic"), async (req, res) => {
     }
   }
 });
+
+// Helper function to get team name by ID
+function getTeamNameById(teams, teamId) {
+  const team = teams.find((t) => t._id === teamId);
+  return team ? team.name : "Unknown Team";
+}
 
 // Health check endpoint
 app.get("/health", (req, res) => {
