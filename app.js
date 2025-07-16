@@ -51,6 +51,42 @@ async function connectToMongoDB() {
   }
 }
 
+app.post("/login/validation", async (req, res) => {
+  console.log("🔔 Validation endpoint hit");
+
+  const { email } = req.body;
+  console.log("Received email from frontend:", email);
+
+  try {
+    const client = await connectToMongoDB(); // Assuming this returns a connected MongoClient
+    const db = client.db(dbName);
+    const collection = db.collection(collectionName);
+
+    // Search for the email across all team members
+    const memberExists = await collection.findOne({
+      "teams.members.memberID.email": email,
+    });
+
+    if (memberExists) {
+      console.log("✅ Email found in the database.");
+      return res
+        .status(200)
+        .json({ status: "success", message: "Email exists." });
+    } else {
+      console.log("❌ Email does not exist in any team.");
+      return res
+        .status(404)
+        .json({ status: "fail", message: "Email does not exist." });
+    }
+  } catch (error) {
+    console.error("🔥 Error during validation:", error);
+    return res
+      .status(500)
+      .json({ status: "error", message: "Internal server error." });
+  }
+});
+
+
 // GET route to fetch all data
 app.get("/api/calldata", async (req, res) => {
   console.log("📥 Client triggered the API call data");
