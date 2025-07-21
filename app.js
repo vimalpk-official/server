@@ -4,6 +4,7 @@ import dotenv from "dotenv";
 import cors from "cors";
 import multer from "multer";
 import { ObjectId } from "mongodb";
+import nodemailer from "nodemailer";
 
 dotenv.config();
 
@@ -11,14 +12,15 @@ const app = express();
 const PORT = process.env.PORT || 7000;
 
 app.use(cors());
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 
-const storage = multer.memoryStorage();
 const upload = multer({
-  storage: storage,
+  storage: multer.memoryStorage(),
   limits: {
-    fileSize: 5 * 1024 * 1024, // 5MB limit
+    fileSize: 10 * 1024 * 1024, // Max file size (10MB)
+    fieldSize: 10 * 1024 * 1024, // Max size per non-file field (10MB)
+    fields: 20, // optional: total number of non-file fields
   },
 });
 
@@ -35,53 +37,131 @@ if (!uri || !dbName || !collectionName) {
   process.exit(1);
 }
 
+// Keep a shared client instance for reuse
+let mongoClient = null;
+
 async function connectToMongoDB() {
+  if (mongoClient && mongoClient.topology?.isConnected()) {
+    return mongoClient;
+  }
+
   try {
-    const client = new MongoClient(uri, {
+    mongoClient = new MongoClient(uri, {
       useNewUrlParser: true,
       useUnifiedTopology: true,
+      maxPoolSize: 10, // ✅ Use up to 10 pooled connections (ideal for free tier)
     });
-    await client.connect();
+
+    await mongoClient.connect();
     console.log("✅ Connected to MongoDB");
-    return client;
+    return mongoClient;
   } catch (error) {
     console.error("❌ MongoDB connection error:", error);
     throw error;
   }
 }
 
-app.post("/login/validation", async (req, res) => {
-  console.log("🔔 Validation endpoint hit");
+// Function to generate 6-digit code
+function generateSixDigitCode() {
+  return Math.floor(100000 + Math.random() * 900000).toString();
+}
 
+// Nodemailer transporter setup
+const transporter = nodemailer.createTransport({
+  service: "gmail",
+  auth: {
+    user: "socialbeatteams@gmail.com",
+    pass: "izei hqpt zhab rngx", // Gmail App Password
+  },
+});
+
+// Function to send plain text email
+async function sendVerificationEmail(receiverEmail, code) {
+  const mailOptions = {
+    from: "socialbeatteams@gmail.com",
+    to: receiverEmail,
+    subject: "Login Verification Code",
+    text: `Dear user,
+
+Please use the following 6-digit code to log in to your account:
+
+Code: ${code}
+
+If you did not request this, please ignore this message.
+
+- SocialBeat Teams`,
+  };
+
+  await transporter.sendMail(mailOptions);
+}
+
+// Main route handler
+app.post("/login/validation", async (req, res) => {
   const { email } = req.body;
-  console.log("Received email from frontend:", email);
+  console.log("🔔 Validation requested for:", email);
+
+  const HR_FINANCE_TEAM_ID = "634eefb4b35a8abf6acbdd3a";
 
   try {
-    const client = await connectToMongoDB(); // Assuming this returns a connected MongoClient
+    const client = await connectToMongoDB();
     const db = client.db(dbName);
     const collection = db.collection(collectionName);
 
-    // Search for the email across all team members
+    // Step 1: Check if member exists
     const memberExists = await collection.findOne({
       "teams.members.memberID.email": email,
     });
 
-    if (memberExists) {
-      console.log("✅ Email found in the database.");
-      return res
-        .status(200)
-        .json({ status: "success", message: "Email exists." });
-    } else {
-      console.log("❌ Email does not exist in any team.");
-      return res
-        .status(404)
-        .json({ status: "fail", message: "Email does not exist." });
+    if (!memberExists) {
+      console.log("❌ Email not found.");
+      return res.status(404).json({
+        status: "fail",
+        message: "Email does not exist.",
+        emailExists: false,
+        inHRTeam: false,
+      });
     }
+
+    // Step 2: Check if in HR/Finance team
+    const memberInHRTeam = await collection.findOne({
+      teams: {
+        $elemMatch: {
+          _id: HR_FINANCE_TEAM_ID,
+          members: {
+            $elemMatch: {
+              "memberID.email": email,
+            },
+          },
+        },
+      },
+    });
+
+    const inHRTeam = Boolean(memberInHRTeam);
+
+    // Step 3: Generate OTP code
+    const code = generateSixDigitCode();
+
+    // Step 4: Send verification email
+    await sendVerificationEmail(email, code);
+    console.log(`📧 Sent verification code to ${email}: ${code}`);
+
+    // In your backend, use consistent naming:
+    return res.status(200).json({
+      status: "success",
+      message: inHRTeam
+        ? "Email exists and is in HR & Finance team."
+        : "Email exists but not in HR & Finance team.",
+      emailExists: true,
+      inHRTeam,
+      codeSent: true,
+      devCode: code, // ✅ Keep this consistent with frontend
+    });
   } catch (error) {
     console.error("🔥 Error during validation:", error);
-    return res
-      .status(500)
-      .json({ status: "error", message: "Internal server error." });
+    return res.status(500).json({
+      status: "error",
+      message: "Internal server error.",
+    });
   }
 });
 
@@ -376,17 +456,6 @@ app.post("/update/member", upload.single("profilePic"), async (req, res) => {
   const formData = req.body;
   const memberIdToUpdate = formData.importance;
 
-  // Parse teamIds from formData (assuming it comes as a string or array)
-  let teamIds = [];
-  if (formData.teamIds) {
-    teamIds = Array.isArray(formData.teamIds)
-      ? formData.teamIds
-      : JSON.parse(formData.teamIds);
-  }
-
-  console.log("Form Data:", formData);
-  console.log("Team IDs:", teamIds);
-
   let client;
 
   try {
@@ -405,18 +474,12 @@ app.post("/update/member", upload.single("profilePic"), async (req, res) => {
       });
     }
 
-    if (!teamIds || teamIds.length === 0) {
-      return res.status(400).json({
-        success: false,
-        message: "At least one team ID is required",
-      });
-    }
-
     client = await connectToMongoDB();
     const db = client.db(dbName);
     const collection = db.collection(collectionName);
 
     // Find the document that contains the member to update
+    // Based on your data structure, it should be "teams.members.memberID._id"
     const documentWithMember = await collection.findOne({
       "teams.members.memberID._id": memberIdToUpdate,
     });
@@ -428,13 +491,16 @@ app.post("/update/member", upload.single("profilePic"), async (req, res) => {
       });
     }
 
-    // Find the existing member data
+    // Find which team contains the member
+    let foundTeam = null;
     let foundMember = null;
+
     for (const team of documentWithMember.teams) {
       const member = team.members.find(
         (m) => m.memberID._id === memberIdToUpdate
       );
       if (member) {
+        foundTeam = team;
         foundMember = member;
         break;
       }
@@ -460,13 +526,7 @@ app.post("/update/member", upload.single("profilePic"), async (req, res) => {
       };
     }
 
-    // Build team array for the member
-    const teamArray = teamIds.map((teamId) => ({
-      name: getTeamNameById(documentWithMember.teams, teamId),
-      _id: teamId,
-    }));
-
-    // Build the updated member object
+    // Build the updated member object, preserving important original data
     const updatedMember = {
       _id: memberIdToUpdate,
       name: formData.name,
@@ -477,15 +537,12 @@ app.post("/update/member", upload.single("profilePic"), async (req, res) => {
       bio: formData.about || foundMember.memberID.bio || "",
       designation:
         formData.designation || foundMember.memberID.designation || "",
-      team: teamArray,
+      team: foundMember.memberID.team || [],
       doj: formData.doj || foundMember.memberID.doj || "",
       dob: formData.dob || foundMember.memberID.dob || "",
       yoe: formData.yoe || foundMember.memberID.yoe || "",
       designationText:
-        formData.designationText ||
-        formData.designation ||
-        foundMember.memberID.designationText ||
-        "",
+        formData.designation || foundMember.memberID.designationText || "",
       createdAt: foundMember.memberID.createdAt || new Date(),
       updatedAt: new Date(),
       __v: foundMember.memberID.__v || 0,
@@ -493,78 +550,35 @@ app.post("/update/member", upload.single("profilePic"), async (req, res) => {
 
     console.log("Updated member data:", updatedMember);
 
-    // Step 1: Remove member from all teams first
-    await collection.updateMany(
+    // Update the member in ALL teams where they exist
+    const updateResult = await collection.updateMany(
       { "teams.members.memberID._id": memberIdToUpdate },
       {
-        $pull: {
-          "teams.$[].members": { "memberID._id": memberIdToUpdate },
+        $set: {
+          "teams.$[team].members.$[member].memberID": updatedMember,
+          updatedAt: new Date(),
         },
-        $set: { updatedAt: new Date() },
+      },
+      {
+        arrayFilters: [
+          { "team.members.memberID._id": memberIdToUpdate },
+          { "member.memberID._id": memberIdToUpdate },
+        ],
       }
     );
 
-    // Step 2: Add/Update member in specified teams
-    const teamUpdateResults = [];
-    let updatedTeamCount = 0;
-
-    // Use the existing member's _id for consistency across all teams
-    const memberEntryId = foundMember._id;
-
-    for (const teamId of teamIds) {
-      // Check if team exists in the document
-      const teamExists = documentWithMember.teams.some(
-        (team) => team._id === teamId
-      );
-
-      if (!teamExists) {
-        console.log(`Team ${teamId} not found in document`);
-        teamUpdateResults.push({
-          teamId: teamId,
-          success: false,
-          message: "Team not found",
-        });
-        continue;
-      }
-
-      // Create member data structure with same _id
-      const memberData = {
-        memberID: updatedMember,
-        _id: memberEntryId, // Use the same _id for all team entries
-      };
-
-      // Add member to the specific team
-      const result = await collection.updateOne(
-        { "teams._id": teamId },
-        {
-          $push: { "teams.$.members": memberData },
-          $set: { updatedAt: new Date() },
-        }
-      );
-
-      teamUpdateResults.push({
-        teamId: teamId,
-        success: result.modifiedCount > 0,
-        modifiedCount: result.modifiedCount,
-      });
-
-      if (result.modifiedCount > 0) updatedTeamCount++;
-    }
-
-    if (updatedTeamCount === 0) {
+    if (updateResult.modifiedCount === 0) {
       return res.status(400).json({
         success: false,
-        message: "Failed to update member in any team",
-        teamResults: teamUpdateResults,
+        message: "Failed to update member",
       });
     }
 
     console.log("✅ Member updated successfully");
     res.status(200).json({
       success: true,
-      message: `Member updated successfully in ${updatedTeamCount} team(s)`,
+      message: `Member updated successfully in ${updateResult.modifiedCount} document(s)`,
       data: updatedMember,
-      teamResults: teamUpdateResults,
     });
   } catch (error) {
     console.error("❌ Error updating member:", error);
@@ -578,6 +592,131 @@ app.post("/update/member", upload.single("profilePic"), async (req, res) => {
       await client.close();
       console.log("🔒 MongoDB connection closed");
     }
+  }
+});
+
+// Health check endpoint
+app.get("/health", (req, res) => {
+  res.status(200).json({
+    success: true,
+    message: "Server is healthy",
+    timestamp: new Date().toISOString(),
+  });
+});
+
+app.post("/position/change", async (req, res) => {
+  try {
+    const { team: slug, members } = req.body;
+
+    console.log(req.body, "this is client data");
+
+    if (!slug || !Array.isArray(members)) {
+      return res.status(400).json({
+        success: false,
+        message: "Missing 'team' or 'members' array",
+      });
+    }
+
+    const formattedData = members.map((item, index) => ({
+      memberID: {
+        _id: item.key ?? `auto-${index}`,
+        name: item.name ?? "N/A",
+        email: item.email ?? "N/A",
+        isActive: item.isActive ?? true,
+        created_by: item.created_by ?? "unknown",
+        profilePicture: item.profilePicture ?? "",
+        bio: item.bio ?? item?.memberData?.bio ?? "N/A",
+        designation: item.designation ?? "N/A",
+        designationText: item.designation ?? "N/A",
+        team: item.team
+          ? item.team.split(",").map((teamName, idx) => ({
+              name: teamName.trim(),
+              _id: teamName.trim() || `team-${idx}`,
+            }))
+          : [{ name: "N/A", _id: "N/A" }],
+        yoe: item.yoe ?? 0,
+        doj: item.doj ?? "N/A",
+        dob: item.dob ?? "N/A",
+        position: item.position ?? index + 1,
+        createdAt: item.createdAt ?? new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        __v: 0,
+      },
+      _id: item._id ?? item.key ?? `fallback-${index}`,
+    }));
+
+    const client = await connectToMongoDB();
+    const db = client.db(dbName);
+    const collection = db.collection(collectionName);
+
+    // Update the team's members array where slug matches
+    const result = await collection.updateOne(
+      { "teams._id": slug }, // Find document with team that has matching slug
+      {
+        $set: {
+          "teams.$.members": formattedData, // Replace the members array for matched team
+        },
+      }
+    );
+
+    console.log(formattedData);
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: `Team with slug '${slug}' not found`,
+      });
+    }
+
+    if (result.modifiedCount === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "No changes were made to the team members",
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: "Members replaced successfully",
+      data: {
+        matchedCount: result.matchedCount,
+        modifiedCount: result.modifiedCount,
+        membersCount: formattedData.length,
+      },
+    });
+  } catch (err) {
+    console.error("Update failed:", err);
+    res.status(500).json({
+      success: false,
+      message: err.message,
+    });
+  }
+});
+
+app.post("/get/team", async (req, res) => {
+  const teamId = req.body.id;
+
+  const client = await connectToMongoDB();
+  const db = client.db(dbName);
+  const collection = db.collection(collectionName);
+
+  try {
+    const result = await collection
+      .aggregate([
+        { $unwind: "$teams" },
+        { $match: { "teams._id": teamId } },
+        { $project: { members: "$teams.members", _id: 0 } },
+      ])
+      .toArray();
+
+    if (result.length > 0) {
+      res.status(200).json({ members: result[0].members });
+    } else {
+      res.status(404).json({ message: "Team not found" });
+    }
+  } catch (error) {
+    console.error("Error retrieving team members:", error);
+    res.status(500).json({ message: "Internal server error" });
   }
 });
 
