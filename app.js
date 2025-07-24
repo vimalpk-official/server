@@ -1,28 +1,59 @@
 import express from "express";
-import { MongoClient } from "mongodb";
+import { MongoClient, ObjectId } from "mongodb";
 import dotenv from "dotenv";
 import cors from "cors";
 import multer from "multer";
-import { ObjectId } from "mongodb";
 import nodemailer from "nodemailer";
+import path from "path";
+import fs from "fs"; // ✅ Added
+import { fileURLToPath } from "url";
+import { dirname } from "path";
+
+// Fix for __dirname in ESM
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 7000;
+const API_ENDPOINT = process.env.API_ENDPOINT;
 
-app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: {
-    fileSize: 10 * 1024 * 1024, // Max file size (10MB)
-    fieldSize: 10 * 1024 * 1024, // Max size per non-file field (10MB)
-    fields: 20, // optional: total number of non-file fields
+const storage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    const uploadPath = path.join(__dirname, "uploads");
+
+    // Ensure uploads folder exists
+    fs.mkdirSync(uploadPath, { recursive: true });
+
+    cb(null, uploadPath);
+  },
+  filename: function (req, file, cb) {
+    const dateStamp = new Date().toISOString().split("T")[0]; // e.g., "2025-07-21"
+    const ext = path.extname(file.originalname); // preserve original extension
+    const baseName = path.basename(file.originalname, ext); // remove extension
+    cb(null, `${baseName}-${dateStamp}${ext}`);
   },
 });
+
+const upload = multer({ storage });
+
+// Serve static files
+app.use("/uploads", express.static(path.join(__dirname, "uploads")));
+
+app.use(express.static(path.join(__dirname, "public")));
+
+app.use(
+  cors({
+    origin: true,
+    credentials: true,
+  })
+);
+
+app.use(express.static(path.join(__dirname, "public")));
 
 const uri = process.env.MONGO_URI;
 const dbName = process.env.DB_NAME;
@@ -66,12 +97,14 @@ function generateSixDigitCode() {
   return Math.floor(100000 + Math.random() * 900000).toString();
 }
 
-// Nodemailer transporter setup
+const mailid = process.env.MAILID;
+const mailapppassword = process.env.MAILAPPPASSWORD;
+
 const transporter = nodemailer.createTransport({
   service: "gmail",
   auth: {
-    user: "socialbeatteams@gmail.com",
-    pass: "izei hqpt zhab rngx", // Gmail App Password
+    user: mailid,
+    pass: mailapppassword,
   },
 });
 
@@ -87,7 +120,6 @@ Please use the following 6-digit code to log in to your account:
 
 Code: ${code}
 
-If you did not request this, please ignore this message.
 
 - SocialBeat Teams`,
   };
@@ -165,6 +197,47 @@ app.post("/login/validation", async (req, res) => {
   }
 });
 
+// --- Route: OTP Verify ---
+app.post("/login/verify-otp", async (req, res) => {
+  const { email, otp } = req.body;
+  if (!email || !otp) {
+    return res
+      .status(400)
+      .json({ status: "fail", message: "Email and OTP required." });
+  }
+
+  const cleanEmail = email.trim().toLowerCase();
+  const record = otpStore.get(cleanEmail);
+
+  if (!record) {
+    return res.status(404).json({
+      status: "fail",
+      message: "No OTP found or already used.",
+    });
+  }
+
+  if (Date.now() > record.expiresAt) {
+    otpStore.delete(cleanEmail);
+    return res.status(410).json({
+      status: "fail",
+      message: "OTP expired.",
+    });
+  }
+
+  if (record.otp !== otp) {
+    return res.status(401).json({
+      status: "fail",
+      message: "Invalid OTP.",
+    });
+  }
+
+  // Success: clear OTP so it can't be reused
+  otpStore.delete(cleanEmail);
+
+  // TODO: Create session/JWT here if needed
+  return res.status(200).json({ status: "success" });
+});
+
 // GET route to fetch all data
 app.get("/api/calldata", async (req, res) => {
   console.log("📥 Client triggered the API call data");
@@ -203,11 +276,9 @@ app.post("/save/data", upload.single("profilePic"), async (req, res) => {
   console.log("💾 Save data endpoint triggered");
   let client;
 
-  // Define teamOptions if not already defined elsewhere
   const teamOptions = [
     { value: "634eefb4b35a8abf6acbdd3a", label: "HR & Finance" },
     { value: "634eefb4b35a8abf6acbdd2c", label: "Technology" },
-    // Add more team options as needed
   ];
 
   try {
@@ -215,38 +286,32 @@ app.post("/save/data", upload.single("profilePic"), async (req, res) => {
     const imageFile = req.file;
 
     console.log("📝 Form Data:", formData);
-    console.log("🖼️ Uploaded File:", imageFile ? "File received" : "No file");
+    console.log(
+      "🖼️ Uploaded File:",
+      imageFile ? imageFile.filename : "No file"
+    );
 
-    // Validate required fields
-    if (!formData.name || !formData.email || !formData.teamIds) {
+    // ✅ Only "name" is required, rest can be optional
+    if (!formData.name) {
       return res.status(400).json({
         success: false,
-        message: "Missing required fields: name, email, or teamIds",
+        message: "Missing required field: name",
       });
     }
 
-    // Process image
-    let profilePictureData = null;
-    if (imageFile) {
-      profilePictureData = {
-        data: imageFile.buffer.toString("base64"),
-        contentType: imageFile.mimetype,
-        filename: imageFile.originalname,
-        size: imageFile.size,
-      };
-    }
-
-    // Parse teamIds if it's a string
+    // Parse teamIds and teamNames safely
     let teamIds = formData.teamIds;
     if (typeof teamIds === "string") {
       try {
         teamIds = JSON.parse(teamIds);
       } catch (e) {
-        teamIds = [teamIds]; // If it's not valid JSON, treat as single ID
+        teamIds = [teamIds];
       }
     }
+    if (!Array.isArray(teamIds)) {
+      teamIds = [];
+    }
 
-    // Parse teamNames if it's a string
     let teamNames = formData.teamNames;
     if (typeof teamNames === "string") {
       try {
@@ -255,18 +320,17 @@ app.post("/save/data", upload.single("profilePic"), async (req, res) => {
         teamNames = [teamNames];
       }
     }
+    if (!Array.isArray(teamNames)) {
+      teamNames = [];
+    }
 
-    // Map team names from teamIds - use formData.teamNames if available, otherwise use teamOptions
     const mappedTeams = teamIds.map((teamId, index) => {
-      // First try to use the provided teamNames
-      if (teamNames && teamNames[index]) {
+      if (teamNames[index]) {
         return {
           _id: teamId,
           name: teamNames[index],
         };
       }
-
-      // Fallback to teamOptions lookup
       const team = teamOptions.find((option) => option.value === teamId);
       return {
         _id: teamId,
@@ -274,28 +338,29 @@ app.post("/save/data", upload.single("profilePic"), async (req, res) => {
       };
     });
 
-    console.log(mappedTeams, "mapped teams");
+    // ✅ Build the final image URL (served via /uploads)
+    const profilePictureUrl = imageFile
+      ? `${API_ENDPOINT}/${imageFile.filename}`
+      : "";
 
     const memberData = {
       memberID: {
         _id: new ObjectId().toString(),
         name: formData.name,
-        email: formData.email,
-        ...(profilePictureData && { profilePicture: profilePictureData }),
+        email: formData.email || "",
+        profilePicture: profilePictureUrl,
         bio: formData.content || "",
         designation: formData.designation || "",
         team: mappedTeams,
         doj: formData.doj || "",
         dob: formData.dob || "",
         yoe: formData.yoe || "",
-        designationText: formData.designation || "",
+        designationText: formData.designationText || formData.designation || "",
         createdAt: new Date(),
         updatedAt: new Date(),
         __v: 0,
       },
     };
-
-    console.log(memberData, "member");
 
     const allTeamId = "634eefb4b35a8abf6acbdd2a";
 
@@ -306,7 +371,6 @@ app.post("/save/data", upload.single("profilePic"), async (req, res) => {
     let updatedTeamCount = 0;
     let teamUpdateResults = [];
 
-    // Update specific teams
     for (const teamId of teamIds) {
       const result = await collection.updateOne(
         { "teams._id": teamId },
@@ -325,7 +389,6 @@ app.post("/save/data", upload.single("profilePic"), async (req, res) => {
       if (result.modifiedCount > 0) updatedTeamCount++;
     }
 
-    // Update "All" team
     const result2 = await collection.updateOne(
       { "teams._id": allTeamId },
       {
@@ -333,10 +396,6 @@ app.post("/save/data", upload.single("profilePic"), async (req, res) => {
         $set: { updatedAt: new Date() },
       }
     );
-
-    console.log("✅ Data saved to MongoDB");
-    console.log("📊 Team update results:", teamUpdateResults);
-    console.log("🔄 All team update result:", result2.modifiedCount);
 
     res.status(200).json({
       success: true,
@@ -364,7 +423,6 @@ app.post("/save/data", upload.single("profilePic"), async (req, res) => {
       console.log("🔒 MongoDB connection closed");
     }
   }
-  x;
 });
 
 // FIXED DELETE route to remove a member
@@ -451,151 +509,179 @@ app.delete("/delete/member", async (req, res) => {
   }
 });
 
-// Fixed Update Member API
 app.post("/update/member", upload.single("profilePic"), async (req, res) => {
   const formData = req.body;
+  const imageFile = req.file;
   const memberIdToUpdate = formData.importance;
+  const allid = "634eefb4b35a8abf6acbdd2a"; // "All" team ID
 
-  let client;
+  console.log("📝 Form Data:", formData);
+
+  // Normalize teamIds
+  let teamIds = formData.teamIds;
+  if (typeof teamIds === "string") {
+    try {
+      teamIds = JSON.parse(teamIds);
+    } catch {
+      teamIds = [teamIds];
+    }
+  }
+  if (!Array.isArray(teamIds)) {
+    teamIds = [];
+  }
 
   try {
-    // Validation
-    if (!memberIdToUpdate) {
-      return res.status(400).json({
-        success: false,
-        message: "Member ID is required",
-      });
-    }
-
-    if (!formData.name || !formData.email) {
-      return res.status(400).json({
-        success: false,
-        message: "Name and email are required fields",
-      });
-    }
-
-    client = await connectToMongoDB();
+    const client = await connectToMongoDB();
     const db = client.db(dbName);
     const collection = db.collection(collectionName);
 
-    // Find the document that contains the member to update
-    // Based on your data structure, it should be "teams.members.memberID._id"
-    const documentWithMember = await collection.findOne({
+    // ✅ Only member ID and name are required
+    if (!memberIdToUpdate || !formData.name) {
+      return res.status(400).json({
+        success: false,
+        message: "Member ID and name are required",
+      });
+    }
+
+    const doc = await collection.findOne({
       "teams.members.memberID._id": memberIdToUpdate,
     });
 
-    if (!documentWithMember) {
+    if (!doc) {
       return res.status(404).json({
         success: false,
         message: "Member not found in any team",
       });
     }
 
-    // Find which team contains the member
-    let foundTeam = null;
-    let foundMember = null;
+    const allTeams = doc.teams;
 
-    for (const team of documentWithMember.teams) {
-      const member = team.members.find(
-        (m) => m.memberID._id === memberIdToUpdate
-      );
-      if (member) {
-        foundTeam = team;
-        foundMember = member;
-        break;
+    // 📸 Handle profile picture logic
+    let profilePictureUrl = "";
+
+    if (imageFile) {
+      profilePictureUrl = `${API_ENDPOINT}/${imageFile.filename}`;
+      console.log("🖼️ Using uploaded file:", profilePictureUrl);
+    } else if (formData.profilePictureUrl) {
+      const imageUrl = formData.profilePictureUrl.trim();
+
+      if (imageUrl.startsWith("http://") || imageUrl.startsWith("https://")) {
+        profilePictureUrl = imageUrl;
+        console.log("🌐 Using external URL:", profilePictureUrl);
+      } else if (
+        imageUrl.startsWith("/uploads/") ||
+        imageUrl.includes("uploads/")
+      ) {
+        const filename = imageUrl.split("/").pop();
+        profilePictureUrl = `${API_ENDPOINT}/${filename}`;
+        console.log("📁 Using existing upload:", profilePictureUrl);
+      } else if (imageUrl.startsWith("data:image/")) {
+        profilePictureUrl = imageUrl;
+        console.log("📊 Using base64 data URL");
+      } else {
+        profilePictureUrl = imageUrl;
+        console.log("⚠️ Using URL as provided:", profilePictureUrl);
+      }
+    } else {
+      // Retain existing profile picture if available
+      for (let team of allTeams) {
+        const existingMember = team.members.find(
+          (m) => m.memberID._id === memberIdToUpdate
+        );
+        if (existingMember?.memberID?.profilePicture) {
+          profilePictureUrl = existingMember.memberID.profilePicture;
+          console.log(
+            "🔄 Keeping existing profile picture:",
+            profilePictureUrl
+          );
+          break;
+        }
       }
     }
 
-    if (!foundMember) {
-      return res.status(404).json({
-        success: false,
-        message: "Member not found in teams",
-      });
+    // Parse `team` JSON string if present
+    let parsedTeam = [];
+    try {
+      if (formData.team) {
+        parsedTeam = JSON.parse(formData.team);
+      }
+    } catch (err) {
+      console.warn("⚠️ Invalid team format");
     }
 
-    // Process image if uploaded
-    let profilePictureData = foundMember.memberID.profilePicture || "";
-    const imageFile = req.file;
-
-    if (imageFile) {
-      profilePictureData = {
-        data: imageFile.buffer.toString("base64"),
-        contentType: imageFile.mimetype,
-        filename: imageFile.originalname,
-        size: imageFile.size,
-      };
-    }
-
-    // Build the updated member object, preserving important original data
+    // ✅ Construct updated member
     const updatedMember = {
       _id: memberIdToUpdate,
       name: formData.name,
-      email: formData.email,
-      isActive: foundMember.memberID.isActive || true,
-      created_by: foundMember.memberID.created_by || "",
-      profilePicture: profilePictureData,
-      bio: formData.about || foundMember.memberID.bio || "",
-      designation:
-        formData.designation || foundMember.memberID.designation || "",
-      team: foundMember.memberID.team || [],
-      doj: formData.doj || foundMember.memberID.doj || "",
-      dob: formData.dob || foundMember.memberID.dob || "",
-      yoe: formData.yoe || foundMember.memberID.yoe || "",
-      designationText:
-        formData.designation || foundMember.memberID.designationText || "",
-      createdAt: foundMember.memberID.createdAt || new Date(),
+      email: formData.email || "",
+      isActive: true,
+      created_by: "",
+      profilePicture: profilePictureUrl,
+      bio: formData.about || "",
+      designation: formData.designation || "",
+      designationText: formData.designationText || formData.designation || "",
+      team: parsedTeam,
+      doj: formData.doj || "",
+      dob: formData.dob || "",
+      yoe: formData.yoe || "",
+      createdAt: new Date(),
       updatedAt: new Date(),
-      __v: foundMember.memberID.__v || 0,
+      __v: 0,
     };
 
-    console.log("Updated member data:", updatedMember);
+    // 🔁 Update all teams
+    for (let team of allTeams) {
+      const teamId = team._id;
+      const isSelected = teamIds.includes(teamId);
+      const isAllTeam = teamId === allid;
 
-    // Update the member in ALL teams where they exist
-    const updateResult = await collection.updateMany(
-      { "teams.members.memberID._id": memberIdToUpdate },
+      const memberIndex = team.members.findIndex(
+        (m) => m.memberID._id === memberIdToUpdate
+      );
+
+      if (isSelected || isAllTeam) {
+        if (memberIndex !== -1) {
+          team.members[memberIndex].memberID = updatedMember;
+        } else {
+          team.members.push({ memberID: updatedMember });
+        }
+      } else if (!isAllTeam && memberIndex !== -1) {
+        team.members.splice(memberIndex, 1);
+      }
+    }
+
+    const updateResult = await collection.updateOne(
+      { _id: doc._id },
       {
         $set: {
-          "teams.$[team].members.$[member].memberID": updatedMember,
+          teams: allTeams,
           updatedAt: new Date(),
         },
-      },
-      {
-        arrayFilters: [
-          { "team.members.memberID._id": memberIdToUpdate },
-          { "member.memberID._id": memberIdToUpdate },
-        ],
       }
     );
 
     if (updateResult.modifiedCount === 0) {
       return res.status(400).json({
         success: false,
-        message: "Failed to update member",
+        message: "No changes were made",
       });
     }
 
-    console.log("✅ Member updated successfully");
     res.status(200).json({
       success: true,
-      message: `Member updated successfully in ${updateResult.modifiedCount} document(s)`,
+      message: "Member updated successfully",
       data: updatedMember,
     });
-  } catch (error) {
-    console.error("❌ Error updating member:", error);
+  } catch (err) {
+    console.error("❌ Error updating member:", err.message);
     res.status(500).json({
       success: false,
       message: "Internal server error",
-      error: error.message,
+      error: err.message,
     });
-  } finally {
-    if (client) {
-      await client.close();
-      console.log("🔒 MongoDB connection closed");
-    }
   }
 });
 
-// Health check endpoint
 app.get("/health", (req, res) => {
   res.status(200).json({
     success: true,
@@ -748,7 +834,11 @@ app.use((err, req, res, next) => {
   });
 });
 
-// 404 handler
+app.get(/^\/(?!api).*/, (req, res) => {
+  console.log("SPA fallback triggered for", req.url);
+  res.sendFile(path.join(__dirname, "public", "index.html"));
+});
+
 app.use((req, res) => {
   res.status(404).json({
     success: false,
